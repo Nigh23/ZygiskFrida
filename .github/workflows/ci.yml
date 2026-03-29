@@ -1,16 +1,37 @@
+name: Build DNF Native Key Dumper
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download NDK
+        run: |
+          wget -O ndk.zip https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip -q ndk.zip
+          mv android-ndk-r25c ndk
+          echo "NDK=$(pwd)/ndk" >> $GITHUB_ENV
+
+      - name: Download Dobby
+        run: |
+          mkdir -p Dobby
+          wget -O Dobby/libdobby.a https://github.com/jmpews/Dobby/releases/download/android-ndk-r25/libdobby_arm64-v8a.a
+
       - name: Create source files
         run: |
-          # 创建 JNI 编译配置
           mkdir -p jni
           
-          # 修复 Application.mk：完整变量名 + 标准 here-doc 格式
           cat > jni/Application.mk << 'EOF'
 APP_ABI := arm64-v8a
 APP_PLATFORM := android-24
 APP_STL := c++_static
 EOF
-          
-          # 修复 Android.mk：完整 Makefile 语法，无截断/缺失
+
           cat > jni/Android.mk << 'EOF'
 LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
@@ -25,8 +46,7 @@ LOCAL_MODULE := dobby
 LOCAL_SRC_FILES := ../Dobby/libdobby.a
 include $(PREBUILT_STATIC_LIBRARY)
 EOF
-          
-          # 修复 main.c：完整头文件 + 修正函数语法
+
           cat > jni/main.c << 'EOF'
 #include <stdint.h>
 #include <stdlib.h>
@@ -35,6 +55,7 @@ EOF
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include "dobby.h"
 
 #define KEY_FILE    "/sdcard/dnf_keys/keys.txt"
@@ -48,6 +69,7 @@ static void save_hex(const char *title, const uint8_t *data, int len) {
     mkdir(DUMP_DIR, 0777);
     int fd = open(KEY_FILE, O_CREAT | O_WRONLY | O_APPEND, 0666);
     if (fd < 0) return;
+
     dprintf(fd, "[%s] ", title);
     for (int i = 0; i < len; i++) {
         dprintf(fd, "%02x", data[i]);
@@ -60,6 +82,7 @@ static void dump_data(const void *data, size_t sz) {
     if (sz < 0x800 || sz > 0x800000) return;
     char path[256];
     snprintf(path, sizeof(path), "%s/%p.bin", DUMP_DIR, data);
+
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd >= 0) {
         write(fd, data, sz);
@@ -89,11 +112,87 @@ void module_init(void) {
     while (dlopen("libil2cpp.so", RTLD_NOLOAD) == NULL || dlopen("libcrypto.so", RTLD_NOLOAD) == NULL) {
         usleep(300000);
     }
+
     void *aes_set_key = DobbySymbolResolver("libcrypto.so", "AES_set_decrypt_key");
     void *aes_cbc = DobbySymbolResolver("libcrypto.so", "AES_cbc_encrypt");
     void *memcpy = DobbySymbolResolver(NULL, "memcpy");
+
     DobbyHook(aes_set_key, new_AES_set_decrypt_key, (void**)&old_AES_set_decrypt_key);
     DobbyHook(aes_cbc, new_AES_cbc_encrypt, (void**)&old_AES_cbc_encrypt);
     DobbyHook(memcpy, new_memcpy, (void**)&old_memcpy);
 }
 EOF
+
+          mkdir -p module/META-INF/com/google/android
+
+          cat > module/module.prop << 'EOF'
+id=dnf_native_dumper
+name=DNF 解密资源提取
+version=2.0
+versionCode=2
+author=anon
+description=自动抓取 AES 密钥与解密后资源文件
+minMagisk=23
+arch=arm64
+EOF
+
+          cat > module/service.sh << 'EOF'
+#!/system/bin/sh
+MODDIR=${0%/*}
+sleep 25
+
+PKG_NAME=com.nexon.mdnf
+LIB_PATH=$MODDIR/libs/arm64-v8a/libdnf_hook.so
+FLAG_FILE=/data/local/tmp/dnf_hooked
+
+while true; do
+  if pidof $PKG_NAME >/dev/null; then
+    if [ ! -f "$FLAG_FILE" ]; then
+      touch "$FLAG_FILE"
+      su -c "
+        pids=\$(pidof $PKG_NAME)
+        for pid in \$pids; do
+          cat $LIB_PATH > /proc/\$pid/mem
+        done
+      " 2>/dev/null
+    fi
+  else
+    rm -f "$FLAG_FILE"
+  fi
+  sleep 3
+done
+EOF
+
+          cat > module/META-INF/com/google/android/updater-script << 'EOF'
+ui_print("=================================");
+ui_print(" DNF 解密资源提取模块");
+ui_print(" 自动抓取 AES 密钥 & 资源文件");
+ui_print("=================================");
+set_perm_recursive(0, 0, 0755, 0644, "/data/adb/modules/dnf_native_dumper");
+set_perm("/data/adb/modules/dnf_native_dumper/service.sh", 0, 0, 0755);
+EOF
+
+          cat > module/META-INF/com/google/android/update-binary << 'EOF'
+#!/sbin/sh
+OUTFD=$2
+ZIP=$3
+cp -rf /tmp/module/* /data/adb/modules/
+chmod 755 /data/adb/modules/dnf_native_dumper/service.sh
+exit 0
+EOF
+
+      - name: Build native library
+        run: ${NDK}/ndk-build APP_ABI=arm64-v8a
+
+      - name: Package Magisk module
+        run: |
+          mkdir -p module/libs/arm64-v8a
+          cp libs/arm64-v8a/libdnf_hook.so module/libs/arm64-v8a/
+          cd module
+          zip -9 -r ../DNF_Native_Module.zip .
+
+      - name: Upload module
+        uses: actions/upload-artifact@v4
+        with:
+          name: DNF_Native_Module
+          path: DNF_Native_Module.zip
